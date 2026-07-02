@@ -2,8 +2,8 @@ name: Refresh trend data
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours
-  workflow_dispatch: {}       # lets you trigger it manually from GitHub's Actions tab
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
 
 jobs:
   refresh:
@@ -18,3 +18,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          ETSY_API_KEY: ${{ secrets.ETSY_API_KEY }}
