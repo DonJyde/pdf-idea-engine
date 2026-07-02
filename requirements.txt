@@ -4,3 +4,4 @@ supabase
 reportlab
 pytrends
 requests
+praw
