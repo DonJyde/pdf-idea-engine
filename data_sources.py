@@ -1,39 +1,46 @@
 """
 Real trend/demand data connectors for the PDF-guide idea engine.
 
-IMPORTANT — READ BEFORE RUNNING:
-This code is written to run against the live internet (Google Trends, Reddit,
-Etsy). It will NOT return live data inside a sandbox with restricted network
-access. Run it on infrastructure with normal outbound internet: your own
-laptop, a Vercel/Render/Railway serverless function, or a small always-on
-worker (e.g. GitHub Actions, as set up in this project).
+v2 change: Reddit and Etsy switched from anonymous scraping to authenticated
+official APIs. Running the original scraping approach from GitHub Actions'
+shared IP ranges got blocked on every single request (429 from Google
+Trends, 403 from Reddit and Etsy) - cloud CI IP ranges are aggressively
+blocklisted by anti-bot systems in a way a normal residential connection
+usually isn't. Authenticated requests are far more resistant to that.
 
-Sources used (all free/unofficial tier):
-  1. Google Trends  — via `pytrends` (unofficial wrapper, no API key).
-                       Supports a `geo` parameter so results can be scoped
-                       to a specific country instead of always US.
-  2. Reddit          — public JSON endpoints (no auth)
-  3. Etsy            — search-results count as a rough "how saturated is this
-                        topic already" competition proxy (no official free API
-                        for this; treat as directional, not precise)
+Sources used:
+  1. Google Trends - via `pytrends` (unofficial, no key). Still anonymous -
+     there is no free authenticated alternative. Expect this one to keep
+     failing intermittently on cloud infrastructure; it degrades gracefully
+     (falls back to a neutral momentum score) rather than crashing.
+  2. Reddit         - official OAuth API via `praw`. Requires a free Reddit
+     "script" app (client_id + client_secret) registered at
+     reddit.com/prefs/apps.
+  3. Etsy           - official Open API v3, keyword search on active
+     listings. Requires a free Etsy developer API key registered at
+     developers.etsy.com. No OAuth needed for this specific endpoint, just
+     the API key in a header.
 
 Install:
-    pip install pytrends requests --break-system-packages
+    pip install pytrends requests praw --break-system-packages
+
+Environment variables required:
+    REDDIT_CLIENT_ID
+    REDDIT_CLIENT_SECRET
+    REDDIT_USER_AGENT   (any descriptive string, e.g. "pdf-idea-engine/0.2 by u/yourname")
+    ETSY_API_KEY
 """
 
 from __future__ import annotations
+import os
 import time
-import re
 from dataclasses import dataclass
 from typing import Optional
 
 import requests
 
-USER_AGENT = "pdf-idea-engine/0.1 (contact: you@yourdomain.com)"
+USER_AGENT = "pdf-idea-engine/0.2 (contact: you@yourdomain.com)"
 
-# Common geo codes for the region selector (ISO 3166-1 alpha-2, plus ""
-# which pytrends treats as "worldwide"). Add more as needed — this is the
-# full list of valid codes: https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2
 REGIONS = [
     {"code": "", "label": "Worldwide"},
     {"code": "US", "label": "United States"},
@@ -47,18 +54,10 @@ REGIONS = [
 
 
 # ---------------------------------------------------------------------------
-# 1. Google Trends — search interest over time for a candidate topic
+# 1. Google Trends - search interest over time for a candidate topic
 # ---------------------------------------------------------------------------
 def get_trends_interest(keyword: str, timeframe: str = "today 3-m", geo: str = "US") -> Optional[dict]:
-    """
-    Returns average and most-recent Google Trends interest (0-100 scale) for
-    `keyword` over the given timeframe and region, plus the trend direction
-    (rising vs falling) comparing the first half of the window to the second.
-
-    `geo` is an ISO country code (e.g. "US", "GB", "NG") or "" for worldwide.
-    """
-    from pytrends.request import TrendReq  # imported lazily so the module
-    # still loads even if pytrends isn't installed yet
+    from pytrends.request import TrendReq
 
     pytrends = TrendReq(hl="en-US", tz=360)
     pytrends.build_payload([keyword], timeframe=timeframe, geo=geo)
@@ -85,10 +84,6 @@ def get_trends_interest(keyword: str, timeframe: str = "today 3-m", geo: str = "
 
 
 def get_related_rising_queries(keyword: str, geo: str = "US") -> list[str]:
-    """Pulls Google's 'rising related queries' for a seed keyword, scoped to
-    `geo`. Closest free equivalent to 'what related problem is spiking right
-    now' — a good source of *new* idea candidates, not just scoring ideas
-    you already thought of."""
     from pytrends.request import TrendReq
 
     pytrends = TrendReq(hl="en-US", tz=360)
@@ -101,24 +96,30 @@ def get_related_rising_queries(keyword: str, geo: str = "US") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Reddit — engagement signal for problem-focused discussion
-#    (Reddit's public search has no region concept, so this stays global)
+# 2. Reddit - official OAuth API via PRAW
 # ---------------------------------------------------------------------------
+def _get_reddit_client():
+    import praw
+
+    return praw.Reddit(
+        client_id=os.environ["REDDIT_CLIENT_ID"],
+        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+        user_agent=os.environ.get("REDDIT_USER_AGENT", USER_AGENT),
+    )
+
+
 def get_reddit_signal(subreddit: str, query: str, limit: int = 25) -> dict:
     """
-    Searches a subreddit for `query` and returns aggregate engagement
-    (upvotes + comments) as a proxy for how much people are actively
-    discussing / struggling with this problem right now.
+    Searches a subreddit for `query` via Reddit's authenticated API and
+    returns aggregate engagement (upvotes + comments) as a proxy for how
+    much people are actively discussing this problem right now.
     """
-    url = f"https://www.reddit.com/r/{subreddit}/search.json"
-    params = {"q": query, "restrict_sr": "on", "sort": "top", "t": "month", "limit": limit}
-    resp = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=10)
-    resp.raise_for_status()
-    posts = resp.json()["data"]["children"]
+    reddit = _get_reddit_client()
+    posts = list(reddit.subreddit(subreddit).search(query, sort="top", time_filter="month", limit=limit))
 
-    total_score = sum(p["data"]["score"] for p in posts)
-    total_comments = sum(p["data"]["num_comments"] for p in posts)
-    top_titles = [p["data"]["title"] for p in posts[:5]]
+    total_score = sum(p.score for p in posts)
+    total_comments = sum(p.num_comments for p in posts)
+    top_titles = [p.title for p in posts[:5]]
 
     return {
         "subreddit": subreddit,
@@ -132,22 +133,27 @@ def get_reddit_signal(subreddit: str, query: str, limit: int = 25) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. Etsy — rough competition/saturation proxy
-#    (Etsy's search doesn't reliably geo-filter for unauthenticated
-#    requests, so this also stays global)
+# 3. Etsy - official Open API v3, active listings keyword search
 # ---------------------------------------------------------------------------
 def get_etsy_competition(query: str) -> dict:
-    url = "https://www.etsy.com/search"
-    params = {"q": query, "explicit": "1"}
-    resp = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=10)
+    """
+    Uses Etsy's official Open API v3 to count active listings matching
+    `query`, as a directional signal for how saturated the topic already is
+    with paid digital products. Requires only an API key (no OAuth) for
+    this endpoint.
+    """
+    api_key = os.environ["ETSY_API_KEY"]
+    url = "https://api.etsy.com/v3/application/listings/active"
+    params = {"keywords": query, "limit": 25}
+    resp = requests.get(url, params=params, headers={"x-api-key": api_key}, timeout=10)
     resp.raise_for_status()
+    data = resp.json()
 
-    match = re.search(r'"total_results":\s*(\d+)', resp.text)
-    result_count = int(match.group(1)) if match else None
-
+    result_count = data.get("count")
     if result_count is None:
-        saturation = "unknown"
-    elif result_count < 500:
+        result_count = len(data.get("results", []))
+
+    if result_count < 500:
         saturation = "low"
     elif result_count < 5000:
         saturation = "medium"
@@ -170,11 +176,8 @@ class IdeaSignal:
 
 
 def gather_signals(topic: str, subreddit: str, geo: str = "US") -> IdeaSignal:
-    """Pulls all three signals for one candidate topic in one region. Wrapped
-    in try/except per-source so one flaky source doesn't kill the whole
-    pipeline — these are unofficial endpoints without an SLA."""
     trend = None
-    reddit = None
+    reddit_sig = None
     etsy = None
 
     try:
@@ -183,7 +186,7 @@ def gather_signals(topic: str, subreddit: str, geo: str = "US") -> IdeaSignal:
         print(f"[warn] trends failed for {topic} ({geo}): {e}")
 
     try:
-        reddit = get_reddit_signal(subreddit, topic)
+        reddit_sig = get_reddit_signal(subreddit, topic)
     except Exception as e:
         print(f"[warn] reddit failed for {topic}: {e}")
 
@@ -192,8 +195,8 @@ def gather_signals(topic: str, subreddit: str, geo: str = "US") -> IdeaSignal:
     except Exception as e:
         print(f"[warn] etsy failed for {topic}: {e}")
 
-    time.sleep(1)  # be polite to unauthenticated endpoints
-    return IdeaSignal(topic=topic, geo=geo, trend_interest=trend, reddit_signal=reddit, etsy_competition=etsy)
+    time.sleep(1)
+    return IdeaSignal(topic=topic, geo=geo, trend_interest=trend, reddit_signal=reddit_sig, etsy_competition=etsy)
 
 
 if __name__ == "__main__":
