@@ -1,39 +1,17 @@
 """
 Scheduled trend-refresh job.
 
-Run this on a schedule (recommended: GitHub Actions, free tier, e.g. every
-6 hours) — NOT inside the Streamlit app itself. It pulls fresh signals for
-a watchlist of candidate topics, scores them, and upserts the results into
-a Supabase table called `ideas`. The Streamlit app (app.py) only ever
-reads from that table, so users never wait on a live scrape and a flaky
-source never breaks the live app.
+Run this on a schedule (GitHub Actions, every 6 hours). It pulls fresh
+signals for a watchlist of candidate topics, in each configured region,
+scores them, and upserts the results into a Supabase table called `ideas`.
+The Streamlit app (app.py) only ever reads from that table, filtered by
+the region the user picks, so users never wait on a live scrape.
 
-Setup:
-    pip install pytrends requests supabase python-dotenv --break-system-packages
+Environment variables required (GitHub Actions "Secrets"):
+    SUPABASE_URL
+    SUPABASE_SERVICE_KEY - the service_role/secret key (write access)
 
-Environment variables required (put these in a .env file locally, and in
-GitHub Actions "Secrets" when you set up the scheduled workflow):
-    SUPABASE_URL       — from your Supabase project settings
-    SUPABASE_SERVICE_KEY — the service_role key (NOT the anon key — this
-                            script needs write access; the anon key used by
-                            app.py should stay read-only)
-
-Supabase table schema (create this once in the Supabase SQL editor):
-
-    create table ideas (
-        id bigint generated always as identity primary key,
-        topic text not null unique,
-        opportunity_score numeric,
-        verdict text,
-        demand_score numeric,
-        momentum_score numeric,
-        whitespace_score numeric,
-        reasons jsonb,
-        raw_trend jsonb,
-        raw_reddit jsonb,
-        raw_etsy jsonb,
-        updated_at timestamptz default now()
-    );
+See MIGRATION.sql for the ideas table schema, including the geo column.
 """
 
 import os
@@ -42,7 +20,7 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client
 
-from data_sources import gather_signals
+from data_sources import gather_signals, REGIONS
 from scoring import score_idea
 
 load_dotenv()
@@ -50,9 +28,6 @@ load_dotenv()
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-# Starter watchlist — expand this over time, or (later) source candidate
-# topics automatically from get_related_rising_queries() in data_sources.py
-# instead of a fixed list.
 WATCHLIST = [
     {"topic": "freelancer budgeting", "subreddit": "freelance"},
     {"topic": "meal prep for shift workers", "subreddit": "MealPrepSunday"},
@@ -60,37 +35,50 @@ WATCHLIST = [
     {"topic": "wedding planning checklist", "subreddit": "weddingplanning"},
     {"topic": "budgeting for new parents", "subreddit": "personalfinance"},
     {"topic": "small business bookkeeping basics", "subreddit": "smallbusiness"},
+    {"topic": "side hustle ideas for beginners", "subreddit": "sidehustle"},
+    {"topic": "study habits for online students", "subreddit": "GetStudying"},
+    {"topic": "first apartment moving checklist", "subreddit": "personalfinance"},
+    {"topic": "job interview preparation guide", "subreddit": "jobs"},
 ]
+
+ACTIVE_REGIONS = ["US", "GB", "NG"]
 
 
 def run():
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    region_lookup = {}
+    for r in REGIONS:
+        region_lookup[r["code"]] = r["label"]
+
     results = []
 
-    for item in WATCHLIST:
-        topic = item["topic"]
-        signal = gather_signals(topic, subreddit=item["subreddit"])
-        result = score_idea(topic, signal.trend_interest, signal.reddit_signal, signal.etsy_competition)
+    for geo in ACTIVE_REGIONS:
+        for item in WATCHLIST:
+            topic = item["topic"]
+            sub = item["subreddit"]
+            signal = gather_signals(topic, subreddit=sub, geo=geo)
+            result = score_idea(topic, signal.trend_interest, signal.reddit_signal, signal.etsy_competition)
 
-        row = {
-            "topic": result.topic,
-            "opportunity_score": result.opportunity_score,
-            "verdict": result.verdict,
-            "demand_score": result.demand_score,
-            "momentum_score": result.momentum_score,
-            "whitespace_score": result.whitespace_score,
-            "reasons": result.reasons,
-            "raw_trend": signal.trend_interest,
-            "raw_reddit": signal.reddit_signal,
-            "raw_etsy": signal.etsy_competition,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        results.append(row)
-        print(f"[ok] {topic}: {result.opportunity_score} ({result.verdict})")
+            row = {}
+            row["topic"] = result.topic
+            row["geo"] = geo
+            row["geo_label"] = region_lookup.get(geo, geo)
+            row["opportunity_score"] = result.opportunity_score
+            row["verdict"] = result.verdict
+            row["demand_score"] = result.demand_score
+            row["momentum_score"] = result.momentum_score
+            row["whitespace_score"] = result.whitespace_score
+            row["reasons"] = result.reasons
+            row["raw_trend"] = signal.trend_interest
+            row["raw_reddit"] = signal.reddit_signal
+            row["raw_etsy"] = signal.etsy_competition
+            row["updated_at"] = datetime.now(timezone.utc).isoformat()
 
-    # upsert on `topic` so re-running just refreshes existing rows
-    supabase.table("ideas").upsert(results, on_conflict="topic").execute()
-    print(f"Upserted {len(results)} ideas into Supabase.")
+            results.append(row)
+            print("[ok]", topic, geo, result.opportunity_score, result.verdict)
+
+    supabase.table("ideas").upsert(results, on_conflict="topic,geo").execute()
+    print("Upserted", len(results), "rows (", len(WATCHLIST), "topics x", len(ACTIVE_REGIONS), "regions).")
 
 
 if __name__ == "__main__":
